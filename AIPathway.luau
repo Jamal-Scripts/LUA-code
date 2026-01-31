@@ -69,7 +69,7 @@ function NPCPathfinder:GetNewPath(goal)
 		-- Adding a small costs table for future navigation tweaks
 		Costs = {
 			Water = 20,
-			Neon = 2 -- maybe lava?
+			Neon = 2 
 		}
 	})
 	
@@ -108,7 +108,7 @@ function NPCPathfinder:Move()
 	
 	local node = waypoints[self.CurrentPoint]
 	
-	-- Handle Jumping
+	-- Handles Jumping
 	if node.Action == Enum.PathWaypointAction.Jump then
 		self.Hum.Jump = true
 	end
@@ -116,7 +116,7 @@ function NPCPathfinder:Move()
 	self.Hum:MoveTo(node.Position)
 	self.Moving = true
 	
-	-- Clean up old connection if we called Move() again before it finished
+	-- clean up old connection if we called Move() again before it finished
 	if self._conn then self._conn:Disconnect() end
 	
 	self._conn = self.Hum.MoveToFinished:Connect(function(reached)
