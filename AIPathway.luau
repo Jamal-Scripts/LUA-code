@@ -1,253 +1,276 @@
 local PathfindingService = game:GetService("PathfindingService")
-local RunService = game:GetService("RunService")
-local Players = game:GetService("Players")
 
 local NPCPathfinder = {}
 NPCPathfinder.__index = NPCPathfinder
 
--- These are the "sweet spot" settings for our NPCs. 
--- Changing these affects every NPC using the module unless you pass a custom table to .new()
-local DEFAULT_CONFIG = {
-    -- Walk speed is for regular patrolling. Run speed kicks in during chases.
-    WalkSpeed = 8,
-    RunSpeed = 16,
-    
-    -- This helps prevent the NPC from stuttering when they get near a waypoint.
-    -- 3 studs is usually enough to trigger the next move smoothly.
-    WaypointReachedDistance = 3,
-    
-    -- How far away can they see players? We make 'lose' slightly higher
-    -- so they don't instantly stop chasing the moment a player ducks behind a tree.
-    DetectionRange = 40,
-    LoseTargetRange = 60,
-    
-    -- Chasing a moving player requires recalculating the path. 
-    -- 0.5s is a good middle ground so the server doesn't lag but the NPC stays on target.
-    PathRecalculateInterval = 0.5,
-    
-    -- Agent settings tell the engine how big the NPC is so it doesn't try
-    -- to cram a big zombie through a tiny 1-stud gap.
-    AgentRadius = 2,
-    AgentHeight = 5,
-    AgentCanJump = true,
+-- Default settings. I kept these lowercase to keep it looking consistent.
+local default_settings = {
+	WalkSpeed = 8,
+	RunSpeed = 16,
+	StopDist = 3, 
+	PathUpdateDelay = 0.4, -- Slightly faster update for better tracking
+	Size = 2,
+	Height = 5,
+	CanJump = true,
+	StuckTime = 2, -- If we haven't moved in 2 seconds, we're stuck
+	StuckThreshold = 0.5 -- Studs moved to be considered "moving"
 }
 
-function NPCPathfinder.new(npcModel: Model, config: table?)
-    -- Grab the essentials. If these aren't here, the script is going to break anyway,
-    -- so we use assert to catch the error early with a clear message.
-    local humanoid = npcModel:FindFirstChildOfClass("Humanoid")
-    local rootPart = npcModel.PrimaryPart
-    
-    assert(humanoid, "Missing Humanoid in " .. npcModel.Name .. ". Check the model structure.")
-    assert(rootPart, "Missing PrimaryPart in " .. npcModel.Name .. ". Did you set the RootPart?")
-    
-    local self = setmetatable({}, NPCPathfinder)
-    
-    self.Model = npcModel
-    self.Humanoid = humanoid
-    self.RootPart = rootPart
-    
-    -- Setup the config. If the dev passed in specific settings, use those. 
-    -- Otherwise, fall back to the defaults we defined at the top.
-    self.Config = {}
-    for key, value in pairs(DEFAULT_CONFIG) do
-        self.Config[key] = (config and config[key]) or value
-    end
-    
-    -- Keeping track of what the NPC is actually doing right now.
-    self.CurrentState = "Idle"
-    self.CurrentTarget = nil
-    self.PatrolPoints = {}
-    self.PatrolIndex = 1
-    self.CurrentPath = nil
-    self.WaypointIndex = 1
-    
-    -- Housekeeping for cleaning up loops and events later.
-    self._connections = {}
-    self._activeLoop = nil
-    
-    self.Humanoid.WalkSpeed = self.Config.WalkSpeed
-    
-    return self
+function NPCPathfinder.new(npc, config)
+	local hum = npc:FindFirstChildOfClass("Humanoid")
+	local root = npc.PrimaryPart
+	
+	-- Rig check
+	if not hum or not root then 
+		error("NPCPathfinder: Missing Humanoid/RootPart in " .. npc.Name) 
+	end
+	
+	local self = setmetatable({}, NPCPathfinder)
+	
+	self.Char = npc
+	self.Hum = hum
+	self.Root = root
+	
+	-- Merge configs manually
+	self.Data = {}
+	for k, v in pairs(default_settings) do
+		self.Data[k] = (config and config[k]) or v
+	end
+	
+	-- Behavior vars
+	self.Status = "Idle" 
+	self.CurrentPoint = 1
+	self.PathData = nil
+	self.Moving = false
+	self.TargetObject = nil -- Used for following moving players
+	
+	-- Tracking for stuck detection
+	self.LastPos = root.Position
+	self.LastMoveTick = os.clock()
+	
+	-- Connections storage
+	self._conn = nil
+	
+	self.Hum.WalkSpeed = self.Data.WalkSpeed
+	
+	return self
 end
 
-function NPCPathfinder:ComputePathTo(destination: Vector3): boolean
-    -- This handles the heavy lifting of talking to Roblox's pathfinding API.
-    local path = PathfindingService:CreatePath({
-        AgentRadius = self.Config.AgentRadius,
-        AgentHeight = self.Config.AgentHeight,
-        AgentCanJump = self.Config.AgentCanJump,
-    })
-    
-    -- pcall here because ComputeAsync can occasionally fail due to external factors.
-    local success, errorMessage = pcall(function()
-        path:ComputeAsync(self.RootPart.Position, destination)
-    end)
-    
-    if not success then
-        warn("Pathfinding error: " .. errorMessage)
-        return false
-    end
-    
-    -- Only update the internal path if the engine actually found a way there.
-    if path.Status == Enum.PathStatus.Success then
-        self.CurrentPath = path
-        self.WaypointIndex = 1
-        return true
-    else
-        -- If it failed, the NPC will just stay put.
-        return false
-    end
+-- Core path logic
+function NPCPathfinder:GetNewPath(goal)
+	-- No point computing if the goal is right on top of us
+	local distToGoal = (self.Root.Position - goal).Magnitude
+	if distToGoal < self.Data.StopDist then return false end
+
+	local p = PathfindingService:CreatePath({
+		AgentRadius = self.Data.Size,
+		AgentHeight = self.Data.Height,
+		AgentCanJump = self.Data.Jump,
+		-- Adding a small costs table for future navigation tweaks
+		Costs = {
+			Water = 20,
+			Neon = 2 -- maybe lava?
+		}
+	})
+	
+	local success, err = pcall(function()
+		p:ComputeAsync(self.Root.Position, goal)
+	end)
+	
+	if success and p.Status == Enum.PathStatus.Success then
+		self.PathData = p
+		self.CurrentPoint = 1
+		return true
+	end
+	
+	-- Log the fail if it's not just a "no path" error
+	if not success then
+		warn("Path computing exploded: " .. tostring(err))
+	end
+	
+	return false
 end
 
-function NPCPathfinder:FollowPath()
-    -- If we don't have a path, there's nowhere to go.
-    if not self.CurrentPath then
-        return false
-    end
-    
-    local waypoints = self.CurrentPath:GetWaypoints()
-    
-    -- If we've finished the list of waypoints, we're done.
-    if self.WaypointIndex > #waypoints then
-        self.CurrentPath = nil
-        return false
-    end
-    
-    local currentWaypoint = waypoints[self.WaypointIndex]
-    local distanceToWaypoint = (self.RootPart.Position - currentWaypoint.Position).Magnitude
-    
-    -- Check if we are close enough to the current point to switch to the next one.
-    if distanceToWaypoint <= self.Config.WaypointReachedDistance then
-        self.WaypointIndex = self.WaypointIndex + 1
-        
-        -- Make sure we didn't just step past the very last point.
-        if self.WaypointIndex > #waypoints then
-            self.CurrentPath = nil
-            return false
-        end
-        
-        currentWaypoint = waypoints[self.WaypointIndex]
-    end
-    
-    -- If the pathfinder says "Jump", we make the NPC jump. 
-    -- Vital for getting over small curbs or stairs.
-    if currentWaypoint.Action == Enum.PathWaypointAction.Jump then
-        self.Humanoid.Jump = true
-    end
-    
-    -- Actually tell the Humanoid to move toward the specific spot.
-    self.Humanoid:MoveTo(currentWaypoint.Position)
-    return true
+-- The actual movement stepper
+function NPCPathfinder:Move()
+	if not self.PathData then 
+		self.Moving = false
+		return 
+	end
+	
+	local waypoints = self.PathData:GetWaypoints()
+	
+	-- Path finished check
+	if self.CurrentPoint > #waypoints then
+		self.Moving = false
+		return
+	end
+	
+	local node = waypoints[self.CurrentPoint]
+	
+	-- Handle Jumping
+	if node.Action == Enum.PathWaypointAction.Jump then
+		self.Hum.Jump = true
+	end
+	
+	self.Hum:MoveTo(node.Position)
+	self.Moving = true
+	
+	-- Clean up old connection if we called Move() again before it finished
+	if self._conn then self._conn:Disconnect() end
+	
+	self._conn = self.Hum.MoveToFinished:Connect(function(reached)
+		if self._conn then self._conn:Disconnect() end
+		self._conn = nil
+		
+		if reached then
+			self.CurrentPoint = self.CurrentPoint + 1
+			
+			-- Only continue if we aren't at the end
+			if self.CurrentPoint <= #waypoints then
+				self:Move()
+			else
+				self.Moving = false
+			end
+		else
+			-- We failed to reach the point (blocked by wall/physics)
+			self.Moving = false
+		end
+	end)
 end
 
-function NPCPathfinder:PatrolBetween(points: {Vector3})
-    -- Don't bother patrolling if there's only one point.
-    if #points < 2 then
-        warn("Patrol requires at least 2 points to function.")
-        return
-    end
-    
-    self:StopCurrentBehavior()
-    self.PatrolPoints = points
-    self.PatrolIndex = 1
-    self.CurrentState = "Patrolling"
-    self.Humanoid.WalkSpeed = self.Config.WalkSpeed
-    
-    -- Running the patrol logic in a separate thread so it doesn't hang the main script.
-    self._activeLoop = task.spawn(function()
-        while self.CurrentState == "Patrolling" do
-            local destination = self.PatrolPoints[self.PatrolIndex]
-            
-            if self:ComputePathTo(destination) then
-                -- Keep moving until we reach the destination or the state changes.
-                while self:FollowPath() and self.CurrentState == "Patrolling" do
-                    task.wait(0.1)
-                end
-                
-                -- Increment index or loop back to the start if we finished the circuit.
-                self.PatrolIndex = self.PatrolIndex + 1
-                if self.PatrolIndex > #self.PatrolPoints then
-                    self.PatrolIndex = 1
-                end
-            else
-                -- If a point is unreachable, just skip it and try the next one.
-                self.PatrolIndex = self.PatrolIndex + 1
-                if self.PatrolIndex > #self.PatrolPoints then
-                    self.PatrolIndex = 1
-                end
-            end
-            
-            -- Small delay so they don't look like robots instantly snapping to the next point.
-            task.wait(0.5)
-        end
-    end)
+-- Stuck check: run this inside a loop to make sure the NPC isn't a vegetable
+function NPCPathfinder:CheckIfStuck()
+	local now = os.clock()
+	local currentPos = self.Root.Position
+	local distMoved = (currentPos - self.LastPos).Magnitude
+	
+	if distMoved > self.Data.StuckThreshold then
+		-- We are moving fine
+		self.LastPos = currentPos
+		self.LastMoveTick = now
+		return false
+	end
+	
+	-- If we haven't moved enough in X seconds
+	if (now - self.LastMoveTick) > self.Data.StuckTime then
+		-- Reset timers
+		self.LastPos = currentPos
+		self.LastMoveTick = now
+		return true
+	end
+	
+	return false
 end
 
-function NPCPathfinder:ChasePlayer(player: Player)
-    if not player.Character or not player.Character.PrimaryPart then
-        return
-    end
-    
-    self:StopCurrentBehavior()
-    self.CurrentState = "Chasing"
-    self.CurrentTarget = player
-    self.Humanoid.WalkSpeed = self.Config.RunSpeed
-    
-    self._activeLoop = task.spawn(function()
-        local lastPathTime = 0
-        
-        while self.CurrentState == "Chasing" and self.CurrentTarget do
-            local targetRoot = self.CurrentTarget.Character and 
-                              self.CurrentTarget.Character.PrimaryPart
-            
-            -- If the player leaves or dies, we stop the chase.
-            if not targetRoot then
-                self:StopCurrentBehavior()
-                break
-            end
-            
-            local distance = (self.RootPart.Position - targetRoot.Position).Magnitude
-            
-            -- Give up if they got too far away.
-            if distance > self.Config.LoseTargetRange then
-                self:StopCurrentBehavior()
-                break
-            end
-            
-            -- Players move, so we need to refresh the path regularly.
-            if tick() - lastPathTime > self.Config.PathRecalculateInterval then
-                self:ComputePathTo(targetRoot.Position)
-                lastPathTime = tick()
-            end
-            
-            self:FollowPath()
-            task.wait(0.1)
-        end
-    end)
+-- High level patrolling logic
+function NPCPathfinder:Patrol(list)
+	if #list < 1 then return end
+	
+	self:Reset()
+	self.Status = "Patrolling"
+	
+	task.spawn(function()
+		local idx = 1
+		while self.Status == "Patrolling" do
+			local dest = list[idx]
+			
+			-- Try to walk to the point
+			if self:GetNewPath(dest) then
+				self:Move()
+				
+				-- Loop until reached or state changed
+				while self.Moving and self.Status == "Patrolling" do
+					-- Stuck handling
+					if self:CheckIfStuck() then
+						-- Try to jump or move slightly to unstick
+						self.Hum.Jump = true
+						task.wait(0.2)
+						self:Move() -- Try moving again
+					end
+					task.wait(0.2)
+				end
+			end
+			
+			-- Wait at the corner for realism
+			task.wait(math.random(1, 3))
+			
+			-- Next point
+			idx = (idx % #list) + 1
+		end
+	end)
 end
 
-function NPCPathfinder:StopCurrentBehavior()
-    -- Reset everything to a clean state. 
-    -- This prevents two loops from running at once if you switch from Patrol to Chase.
-    self.CurrentState = "Idle"
-    self.CurrentTarget = nil
-    self.CurrentPath = nil
-    self.Humanoid.WalkSpeed = self.Config.WalkSpeed
-    
-    -- Stop walking immediately.
-    self.Humanoid:MoveTo(self.RootPart.Position)
+-- Aggressive player tracking
+function NPCPathfinder:Hunt(targetChar)
+	local targetRoot = targetChar:FindFirstChild("HumanoidRootPart")
+	if not targetRoot then return end
+	
+	self:Reset()
+	self.Status = "Chasing"
+	self.TargetObject = targetChar
+	self.Hum.WalkSpeed = self.Data.RunSpeed
+	
+	task.spawn(function()
+		local lastGoal = Vector3.new(0,0,0)
+		
+		while self.Status == "Chasing" and targetChar.Parent do
+			local currentTargetPos = targetRoot.Position
+			
+			-- Optimization: Don't re-calculate if target hasn't moved much
+			local moveDelta = (lastGoal - currentTargetPos).Magnitude
+			
+			if moveDelta > 2 then
+				if self:GetNewPath(currentTargetPos) then
+					lastGoal = currentTargetPos
+					self:Move()
+				end
+			end
+			
+			-- Chase logic doesn't need stuck checks as often because the path refreshes
+			task.wait(self.Data.PathUpdateDelay)
+		end
+		
+		-- If we exited loop, reset
+		if self.Status == "Chasing" then
+			self:Reset()
+		end
+	end)
 end
 
+-- To-do: Add a "LookForTarget" function that uses Raycasts for line-of-sight
+-- To-do: Implement a simple wandering state if no patrol points are found
+
+function NPCPathfinder:Stop()
+	self.Status = "Idle"
+	self.Moving = false
+	self.TargetObject = nil
+	
+	if self._conn then 
+		self._conn:Disconnect() 
+		self._conn = nil
+	end
+	
+	-- Force stop the humanoid
+	self.Hum:MoveTo(self.Root.Position)
+end
+
+-- Full cleanup
+function NPCPathfinder:Reset()
+	self:Stop()
+	self.Hum.WalkSpeed = self.Data.WalkSpeed
+	self.CurrentPoint = 1
+	self.PathData = nil
+end
+
+-- Used for deleting the NPC object from memory
 function NPCPathfinder:Destroy()
-    -- Call this when the NPC is removed from the game to prevent memory leaks.
-    self:StopCurrentBehavior()
-    
-    for _, connection in ipairs(self._connections) do
-        connection:Disconnect()
-    end
-    
-    self._connections = {}
+	self:Reset()
+	-- Clean up references
+	self.Char = nil
+	self.Root = nil
+	self.Hum = nil
+	setmetatable(self, nil)
 end
 
 return NPCPathfinder
