@@ -3,26 +3,34 @@ local PathfindingService = game:GetService("PathfindingService")
 local NPCPathfinder = {}
 NPCPathfinder.__index = NPCPathfinder
 
--- Default settings. I kept these lowercase to keep it looking consistent.
+-- [[ CONFIGURATION ]] --
+-- These are the default values for the NPC. 
+-- I put them in a table so they can be easily overwritten in the .new() function
+-- without having to edit the core script logic later.
 local default_settings = {
 	WalkSpeed = 8,
 	RunSpeed = 16,
-	StopDist = 3, 
-	PathUpdateDelay = 0.4, -- Slightly faster update for better tracking
-	Size = 2,
-	Height = 5,
+	StopDist = 3,       -- Distance to stop from the goal to prevent jittering
+	PathUpdateDelay = 0.4, 
+	Size = 2,           -- Agent radius (should match the rig size)
+	Height = 5,         -- Agent height
 	CanJump = true,
-	StuckTime = 2, -- If we haven't moved in 2 seconds, we're stuck
-	StuckThreshold = 0.5 -- Studs moved to be considered "moving"
+	StuckTime = 2,      -- Time in seconds before we decide the NPC is stuck
+	StuckThreshold = 0.5 -- How many studs it must move to NOT be considered stuck
 }
 
+-- [[ CONSTRUCTOR ]] --
+-- This function creates a new "instance" of our pathfinder object.
+-- We use setmetatable here to connect the new table (self) to the NPCPathfinder functions.
+-- This allows us to have multiple NPCs running off this one module script independently.
 function NPCPathfinder.new(npc, config)
 	local hum = npc:FindFirstChildOfClass("Humanoid")
 	local root = npc.PrimaryPart
 	
-	-- Rig check
+	-- Safety Check: We can't pathfind if the rig is broken. 
+	-- Throwing an error here warns us immediately if we forgot to rig the PrimaryPart.
 	if not hum or not root then 
-		error("NPCPathfinder: Missing Humanoid/RootPart in " .. npc.Name) 
+		error("NPCPathfinder Error: The NPC " .. npc.Name .. " is missing a Humanoid or RootPart.") 
 	end
 	
 	local self = setmetatable({}, NPCPathfinder)
@@ -31,24 +39,30 @@ function NPCPathfinder.new(npc, config)
 	self.Hum = hum
 	self.Root = root
 	
-	-- Merge configs manually
+	-- Merging the default settings with any custom settings passed in 'config'.
+	-- This creates a single 'Data' table that holds the final stats for this specific NPC.
 	self.Data = {}
 	for k, v in pairs(default_settings) do
 		self.Data[k] = (config and config[k]) or v
 	end
 	
-	-- Behavior vars
+	-- State Management:
+	-- We track 'Status' so we can break out of loops (like Patrolling) if the NPC needs to switch to Chasing.
 	self.Status = "Idle" 
 	self.CurrentPoint = 1
 	self.PathData = nil
 	self.Moving = false
-	self.TargetObject = nil -- Used for following moving players
+	self.TargetObject = nil 
 	
-	-- Tracking for stuck detection
+	-- Anti-Stuck Variables:
+	-- We store the last known position and the time it was recorded.
+	-- Later, we compare current position against this to see if we've been walking into a wall.
 	self.LastPos = root.Position
 	self.LastMoveTick = os.clock()
 	
-	-- Connections storage
+	-- Connection placeholder:
+	-- We need to store the MoveToFinished connection so we can Disconnect() it manually.
+	-- If we don't disconnect it, we risk memory leaks or having old events fire during new paths.
 	self._conn = nil
 	
 	self.Hum.WalkSpeed = self.Data.WalkSpeed
@@ -56,23 +70,31 @@ function NPCPathfinder.new(npc, config)
 	return self
 end
 
--- Core path logic
+-- [[ PATH COMPUTATION ]] --
+-- This calculates the raw path data using Roblox's A* algorithm.
+-- I included a distance check at the start to save CPU resources: 
+-- if the goal is very close, computing a full path is unnecessary overhead.
 function NPCPathfinder:GetNewPath(goal)
-	-- No point computing if the goal is right on top of us
 	local distToGoal = (self.Root.Position - goal).Magnitude
+	
+	-- Optimization: Don't compute if we are practically already there.
 	if distToGoal < self.Data.StopDist then return false end
 
 	local p = PathfindingService:CreatePath({
 		AgentRadius = self.Data.Size,
 		AgentHeight = self.Data.Height,
 		AgentCanJump = self.Data.Jump,
-		-- Adding a small costs table for future navigation tweaks
+		-- Costs map: This tells the pathfinder to avoid Water (high cost) 
+		-- but allows it if there is absolutely no other way.
 		Costs = {
 			Water = 20,
 			Neon = 2 
 		}
 	})
 	
+	-- Error Handling:
+	-- Pathfinding can fail if the NavMesh isn't loaded or the coordinates are invalid.
+	-- We wrap this in a pcall (protected call) to prevent the entire script from crashing on a calc error.
 	local success, err = pcall(function()
 		p:ComputeAsync(self.Root.Position, goal)
 	end)
@@ -83,15 +105,16 @@ function NPCPathfinder:GetNewPath(goal)
 		return true
 	end
 	
-	-- Log the fail if it's not just a "no path" error
 	if not success then
-		warn("Path computing exploded: " .. tostring(err))
+		warn("Pathfinding Service failed to compute path: " .. tostring(err))
 	end
 	
 	return false
 end
 
--- The actual movement stepper
+-- [[ MOVEMENT LOGIC ]] --
+-- This is the core movement loop. It iterates through the waypoints generated by GetNewPath.
+-- It is recursive: when one point is reached, it calls itself to go to the next.
 function NPCPathfinder:Move()
 	if not self.PathData then 
 		self.Moving = false
@@ -100,7 +123,7 @@ function NPCPathfinder:Move()
 	
 	local waypoints = self.PathData:GetWaypoints()
 	
-	-- Path finished check
+	-- Check if we have finished the path.
 	if self.CurrentPoint > #waypoints then
 		self.Moving = false
 		return
@@ -108,7 +131,9 @@ function NPCPathfinder:Move()
 	
 	local node = waypoints[self.CurrentPoint]
 	
-	-- Handles Jumping
+	-- Context Action:
+	-- If the pathfinding service flagged this node as a "Jump" action (e.g., a gap or ledge),
+	-- we force the humanoid to jump state.
 	if node.Action == Enum.PathWaypointAction.Jump then
 		self.Hum.Jump = true
 	end
@@ -116,45 +141,54 @@ function NPCPathfinder:Move()
 	self.Hum:MoveTo(node.Position)
 	self.Moving = true
 	
-	-- clean up old connection if we called Move() again before it finished
+	-- Connection Cleanup:
+	-- Before creating a new MoveToFinished listener, we MUST disconnect the old one.
+	-- If we don't, the old listener might fire for a previous node, messing up the index.
 	if self._conn then self._conn:Disconnect() end
 	
 	self._conn = self.Hum.MoveToFinished:Connect(function(reached)
+		-- Once the event fires, we disconnect it immediately to keep memory clean.
 		if self._conn then self._conn:Disconnect() end
 		self._conn = nil
 		
 		if reached then
+			-- Logic: Successfully reached the node, advance the index and call Move() again.
 			self.CurrentPoint = self.CurrentPoint + 1
 			
-			-- Only continue if we aren't at the end
 			if self.CurrentPoint <= #waypoints then
 				self:Move()
 			else
 				self.Moving = false
 			end
 		else
-			-- We failed to reach the point (blocked by wall/physics)
+			-- Logic: The humanoid stopped before reaching the goal (timed out or blocked).
+			-- We stop the loop here so the main loop (Patrol/Hunt) can decide what to do (e.g., recalc path).
 			self.Moving = false
 		end
 	end)
 end
 
--- Stuck check: run this inside a loop to make sure the NPC isn't a vegetable
+-- [[ STUCK DETECTION ]] --
+-- Pathfinding isn't perfect; NPCs get stuck on corners or unanchored parts.
+-- This function checks if the NPC has moved significantly since the last check.
+-- If (Time Elapsed > Limit) AND (Distance Moved < Threshold), we assume it's stuck.
 function NPCPathfinder:CheckIfStuck()
 	local now = os.clock()
 	local currentPos = self.Root.Position
 	local distMoved = (currentPos - self.LastPos).Magnitude
 	
 	if distMoved > self.Data.StuckThreshold then
-		-- We are moving fine
+		-- The NPC is moving correctly. We update the 'LastPos' to the current spot
+		-- so we can measure from here next time.
 		self.LastPos = currentPos
 		self.LastMoveTick = now
 		return false
 	end
 	
-	-- If we haven't moved enough in X seconds
+	-- If we are here, the NPC hasn't moved enough. Check how long it's been.
 	if (now - self.LastMoveTick) > self.Data.StuckTime then
-		-- Reset timers
+		-- It has been stuck longer than the allowed time.
+		-- We reset the trackers so we don't spam the stuck signal instantly again.
 		self.LastPos = currentPos
 		self.LastMoveTick = now
 		return true
@@ -163,45 +197,51 @@ function NPCPathfinder:CheckIfStuck()
 	return false
 end
 
--- High level patrolling logic
+-- [[ PATROL STATE ]] --
+-- Loops through a list of Vector3 points.
+-- We run this in a task.spawn so it doesn't yield the main script logic.
 function NPCPathfinder:Patrol(list)
 	if #list < 1 then return end
 	
-	self:Reset()
+	self:Reset() -- Clear any old paths/states before starting
 	self.Status = "Patrolling"
 	
 	task.spawn(function()
 		local idx = 1
+		
+		-- Loop runs as long as the status hasn't been changed by another function (like Hunt)
 		while self.Status == "Patrolling" do
 			local dest = list[idx]
 			
-			-- Try to walk to the point
+			-- Attempt to generate a path to the patrol point
 			if self:GetNewPath(dest) then
 				self:Move()
 				
-				-- Loop until reached or state changed
+				-- Monitor the movement
 				while self.Moving and self.Status == "Patrolling" do
-					-- Stuck handling
+					-- If the Stuck Check returns true, we try a simple jump to unstuck the NPC.
+					-- If that fails, the loop continues and likely generates a new path on the next cycle.
 					if self:CheckIfStuck() then
-						-- Try to jump or move slightly to unstick
 						self.Hum.Jump = true
 						task.wait(0.2)
-						self:Move() -- Try moving again
+						self:Move() -- Retry movement command
 					end
 					task.wait(0.2)
 				end
 			end
 			
-			-- Wait at the corner for realism
+			-- Realism: Wait a random amount of time at the point before moving to the next.
 			task.wait(math.random(1, 3))
 			
-			-- Next point
+			-- Cycle the index. If we are at the end of the list, go back to 1.
 			idx = (idx % #list) + 1
 		end
 	end)
 end
 
--- Aggressive player tracking
+-- [[ CHASE STATE ]] --
+-- actively tracks a moving target.
+-- Unlike Patrol, we need to constantly re-calculate the path because the goal is moving.
 function NPCPathfinder:Hunt(targetChar)
 	local targetRoot = targetChar:FindFirstChild("HumanoidRootPart")
 	if not targetRoot then return end
@@ -217,7 +257,9 @@ function NPCPathfinder:Hunt(targetChar)
 		while self.Status == "Chasing" and targetChar.Parent do
 			local currentTargetPos = targetRoot.Position
 			
-			-- Optimization: Don't re-calculate if target hasn't moved much
+			-- Optimization: 
+			-- Pathfinding is expensive. We only re-calculate the path if the target 
+			-- has moved more than 2 studs since the last calculation.
 			local moveDelta = (lastGoal - currentTargetPos).Magnitude
 			
 			if moveDelta > 2 then
@@ -227,35 +269,35 @@ function NPCPathfinder:Hunt(targetChar)
 				end
 			end
 			
-			-- Chase logic doesn't need stuck checks as often because the path refreshes
+			-- We wait a small delay to prevent spamming the PathfindingService.
 			task.wait(self.Data.PathUpdateDelay)
 		end
 		
-		-- If we exited loop, reset
+		-- If the target dies or the loop breaks, we reset to Idle to stop the NPC running in place.
 		if self.Status == "Chasing" then
 			self:Reset()
 		end
 	end)
 end
 
--- To-do: Add a "LookForTarget" function that uses Raycasts for line-of-sight
--- To-do: Implement a simple wandering state if no patrol points are found
-
+-- [[ STOP & CLEANUP ]] --
+-- Forces the NPC to stop moving immediately and clears connections.
 function NPCPathfinder:Stop()
 	self.Status = "Idle"
 	self.Moving = false
 	self.TargetObject = nil
 	
+	-- Critical: Disconnect the MoveToFinished event or it will keep firing in the background.
 	if self._conn then 
 		self._conn:Disconnect() 
 		self._conn = nil
 	end
 	
-	-- Force stop the humanoid
+	-- MoveTo(CurrentPos) overrides the current walk command, making the Humanoid stop.
 	self.Hum:MoveTo(self.Root.Position)
 end
 
--- Full cleanup
+-- Resets variables for a fresh state (used when switching from Patrol to Hunt).
 function NPCPathfinder:Reset()
 	self:Stop()
 	self.Hum.WalkSpeed = self.Data.WalkSpeed
@@ -263,10 +305,10 @@ function NPCPathfinder:Reset()
 	self.PathData = nil
 end
 
--- Used for deleting the NPC object from memory
+-- Destructor: Call this when deleting the NPC to free up memory.
 function NPCPathfinder:Destroy()
 	self:Reset()
-	-- Clean up references
+	-- Clearing references allows the Garbage Collector to remove the object.
 	self.Char = nil
 	self.Root = nil
 	self.Hum = nil
